@@ -96,8 +96,8 @@ def test_on_sample_frame(model_path):
     # Display results
     object_features = features['object_features']
     
-    # Filter out zero rows (no detections)
-    valid_detections = np.any(object_features[:, 4] > 0, axis=1)
+    # Check for valid detections by looking at confidence scores in column 4
+    valid_detections = object_features[:, 4] > 0
     num_detections = np.sum(valid_detections)
     
     logger.info(f"Number of valid detections: {num_detections}")
@@ -106,7 +106,7 @@ def test_on_sample_frame(model_path):
     visualization = frame.copy()
     
     h, w = frame.shape[:2]
-    for i in range(min(len(object_features), 5)):
+    for i in range(len(object_features)):
         if object_features[i, 4] > 0:  # If confidence > 0
             # Denormalize bounding box coordinates
             x_center, y_center = int(object_features[i, 0] * w), int(object_features[i, 1] * h)

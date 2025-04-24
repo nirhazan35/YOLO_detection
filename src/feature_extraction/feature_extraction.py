@@ -335,12 +335,12 @@ def process_split(split_dir, extractor, output_dir):
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Get all frame directories
+    # Get all frame directories ending with _frames
     frame_dirs = []
-    for root, dirs, _ in os.walk(split_dir):
-        for d in dirs:
-            if d.endswith('_frames'):
-                frame_dirs.append(os.path.join(root, d))
+    for item in os.listdir(split_dir):
+        item_path = os.path.join(split_dir, item)
+        if os.path.isdir(item_path) and item.endswith('_frames'):
+            frame_dirs.append(item_path)
     
     logger.info(f"Found {len(frame_dirs)} videos to process in {split_dir}")
     
@@ -396,29 +396,39 @@ def extract_features_from_dataset(data_dir=None, output_dir=None, model_path=Non
     logger.info(f"Saving features to {output_dir}")
     logger.info(f"Using device: {device}")
     
-    # Create output directories
-    for split in ['train', 'val', 'test']:
-        for label in ['accident', 'non_accident']:
-            os.makedirs(os.path.join(output_dir, split, label), exist_ok=True)
+    # Create output directories for accident and non-accident data
+    os.makedirs(os.path.join(output_dir, 'accidents'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'non_accidents'), exist_ok=True)
 
     # Initialize feature extractor
     extractor = YOLOFeatureExtractor(model_path=model_path, device=device)
     
-    # Process each split
+    # Process each category (accidents and non-accidents)
     total_processed = 0
-    for split in ['train', 'val', 'test']:
-        for label in ['accident', 'non_accident']:
-            split_dir = os.path.join(data_dir, split, label)
-            output_split_dir = os.path.join(output_dir, split, label)
-            
-            if not os.path.exists(split_dir):
-                logger.warning(f"Directory not found: {split_dir}")
-                continue
-            
-            logger.info(f"Processing {split}/{label}")
-            count = process_split(split_dir, extractor, output_split_dir)
-            logger.info(f"Processed {count} videos from {split}/{label}")
-            total_processed += count
+    
+    # Process accident videos
+    accident_dir = os.path.join(data_dir, 'accidents')
+    accident_output_dir = os.path.join(output_dir, 'accidents')
+    
+    if os.path.exists(accident_dir):
+        logger.info(f"Processing accident videos")
+        accident_count = process_split(accident_dir, extractor, accident_output_dir)
+        logger.info(f"Processed {accident_count} accident videos")
+        total_processed += accident_count
+    else:
+        logger.warning(f"Directory not found: {accident_dir}")
+    
+    # Process non-accident videos
+    non_accident_dir = os.path.join(data_dir, 'non_accidents')
+    non_accident_output_dir = os.path.join(output_dir, 'non_accidents')
+    
+    if os.path.exists(non_accident_dir):
+        logger.info(f"Processing non-accident videos")
+        non_accident_count = process_split(non_accident_dir, extractor, non_accident_output_dir)
+        logger.info(f"Processed {non_accident_count} non-accident videos")
+        total_processed += non_accident_count
+    else:
+        logger.warning(f"Directory not found: {non_accident_dir}")
     
     logger.info(f"Feature extraction completed. Processed {total_processed} videos.")
 

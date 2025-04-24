@@ -3,3 +3,8 @@
 /data_processing.log
 /dataset_creation.log
 /venv
+*.log
+*.pt
+*.pyc
+*.npz
+*.jpg
