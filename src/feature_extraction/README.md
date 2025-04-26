@@ -1,92 +1,133 @@
-# YOLO11 Feature Extraction
+# Feature Extraction Module
 
-This module extracts features from processed video frames using the YOLO11 model. The features include both object detection features (bounding boxes and confidence scores) and spatial features extracted from the YOLO backbone.
+This module provides functionality for extracting features from pre-processed video frames for road accident detection.
 
-## Features Extracted
+## Overview
 
-The feature extractor outputs two types of features for each video frame:
+The feature extraction module extracts two main types of features:
 
-1. **Object Detection Features**: 
-   - Top 5 objects detected (prioritizing cars, pedestrians, trucks, motorcycles, and buses)
-   - For each object: normalized bounding box coordinates (x, y, width, height) and confidence score
-   - Shape: (N, 5, 5) where N is the number of frames
+1. **RGB Frame Features** (using YOLO11):
+   - **Object Detection Features**: Bounding boxes and confidence scores for road-related objects (cars, pedestrians, trucks, bicycles, motorcycles, buses, and traffic lights).
+   - **Spatial Features**: High-dimensional feature vectors extracted from YOLO11's backbone network.
 
-2. **Spatial Features**:
-   - 256-dimensional feature vector extracted from the YOLO backbone
-   - Represents spatial and semantic information about the entire scene
-   - Shape: (N, 256) where N is the number of frames
+2. **Optical Flow Features**:
+   - **Motion Features**: Statistical and CNN-based features extracted from optical flow frames.
 
-## Configuration
+## Components
 
-All parameters are managed through the `config.py` file:
+- `feature_extractor.py`: YOLO11-based feature extractor for RGB frames
+- `flow_feature_extractor.py`: Feature extractors for optical flow frames
+- `utils.py`: Helper functions for visualization and data handling
+- `config.py`: Configuration settings for the feature extraction
 
-- `YOLO_CONFIG`: Paths to model weights, processed data, and output directory
-- `FEATURE_CONFIG`: Classes to detect, maximum objects per frame, and spatial feature dimension
-- `GPU_CONFIG`: GPU settings including whether to use GPU and mixed precision
+## Architecture
 
-To modify any settings, simply edit the `config.py` file.
+The system uses a hybrid approach as follows:
+
+1. **YOLO Branch** (Objects + Spatial Context):
+   - Extracts object detection features (bounding boxes, class probabilities)
+   - Gets backbone features for spatial context information
+
+2. **Optical Flow Branch** (Motion Patterns):
+   - Processes pre-computed optical flow frames
+   - Extracts motion features using a simple CNN and statistical methods
+
+3. **Feature Combination**:
+   - Combines RGB features and flow features for a complete representation
+   - Features can be used separately or combined for downstream tasks
 
 ## Usage
 
-### Setup and Run
+### Working with Processed Frames
 
-The easiest way to run the feature extraction is using the setup script:
+```python
+from src.feature_extraction import YOLO11FeatureExtractor, SimpleFlowFeatureExtractor
+import cv2
 
-```bash
-./src/feature_extraction/setup_and_run.sh
+# Initialize extractors
+yolo_extractor = YOLO11FeatureExtractor(model_path="yolo11m.pt")
+flow_extractor = SimpleFlowFeatureExtractor()
+
+# Extract features from RGB frame
+rgb_frame = cv2.imread("frame_00.jpg")
+rgb_features = yolo_extractor.extract_features(rgb_frame)
+
+# Extract features from optical flow frame
+flow_frame = cv2.imread("flow_00.jpg")
+flow_features = flow_extractor.extract_features(flow_frame)
+
+# Combine features
+combined_features = np.concatenate([rgb_features, flow_features])
 ```
 
-This script will:
-1. Create a virtual environment if it doesn't exist
-2. Install all necessary dependencies
-3. Download the YOLO11n model
-4. Run a test to verify the feature extraction works
-5. Run the full feature extraction pipeline on the processed data
+### Saving and Loading Features
 
-### Manual Execution
+```python
+from src.feature_extraction.utils import save_features, load_features
 
-If you prefer to run the steps manually:
+# Save features to file
+metadata = {"video_name": "example.mp4", "category": "accident"}
+save_features(features, "features.npz", metadata)
 
-1. Install dependencies:
-```bash
-pip install torch torchvision ultralytics opencv-python numpy
+# Load features from file
+loaded_features, loaded_metadata = load_features("features.npz")
 ```
 
-2. Run the feature extraction:
-```bash
-python src/feature_extraction/run_feature_extraction.py
+### Visualization
+
+```python
+from src.feature_extraction.utils import visualize_detection
+
+# Visualize detections on a frame
+object_features = rgb_features[:25]  # First 25 values are object features
+visualize_detection(frame, object_features, save_path="detection.jpg")
+
+# Visualize feature statistics
+from src.feature_extraction.utils import visualize_feature_statistics
+visualize_feature_statistics(features, save_dir="visualizations")
 ```
 
-## Output
+## Feature Format
 
-The extracted features are saved as NumPy arrays (.npy files) in the output directory specified in the config file, with the following structure:
+Each video produces three types of feature files:
+
+1. **RGB Features**: 
+   - Object detection features (5 objects × 5 values per object = 25 values)
+   - Spatial features (256-dimensional vector)
+   - Total: 281 dimensions per frame
+
+2. **Flow Features**:
+   - Motion statistics and patterns (128-dimensional vector)
+
+3. **Combined Features**:
+   - Concatenation of RGB and flow features (409 dimensions per frame)
+
+## Running the Feature Extraction
+
+To extract features from pre-processed frames, run:
 
 ```
-data/features/
-├── train/
-│   ├── accident/
-│   │   ├── video1_features.npy
-│   │   └── ...
-│   └── non_accident/
-│       ├── video1_features.npy
-│       └── ...
-├── val/
-└── test/
-```
-
-Each .npy file contains a numpy array of shape (N, 281), where:
-- N is the number of frames in the video
-- 281 = 25 (object features: 5 objects × 5 features) + 256 (spatial features)
-
-## Testing
-
-To test the feature extraction without running the full pipeline:
-
-```bash
-python src/feature_extraction/test_feature_extraction.py
+python src/run_feature_extraction.py
 ```
 
 This will:
-1. Download the YOLO11n model if it doesn't exist
-2. Test feature extraction on a sample frame
-3. Save visualization and extracted features to the test_results directory 
+- Extract features from RGB frames in `data/processed/{category}/{video}/frames/`
+- Extract features from flow frames in `data/processed/{category}/{video}/flow/`
+- Save separate feature files for RGB, flow, and combined features
+- Generate visualizations for sample frames
+
+## Configuration
+
+You can modify settings in `config.py`:
+
+- YOLO model settings (confidence threshold, IoU threshold)
+- Feature output settings (directories, file formats)
+- Feature dimensions
+
+## Requirements
+
+- Python 3.8+
+- OpenCV
+- NumPy
+- PyTorch
+- Ultralytics (for YOLO11) 
