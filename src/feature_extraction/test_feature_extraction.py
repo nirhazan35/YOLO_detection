@@ -289,6 +289,63 @@ def test_feature_extraction_pipeline(test_dir=None):
         logger.error(traceback.format_exc())
         return False
 
+def test_feature_shapes():
+    """
+    Test the shape of extracted features.
+    
+    Returns:
+        Boolean indicating if shapes are correct
+    """
+    try:
+        logger.info("Testing feature shapes...")
+        
+        # Create combined feature configuration
+        full_config = {
+            **FEATURE_CONFIG,
+            **GPU_CONFIG, 
+            'model_path': YOLO_CONFIG['model_path']
+        }
+        
+        # Create feature extractor
+        extractor = YOLOFeatureExtractor(config=full_config)
+        
+        # Create test frame
+        dummy_frame = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+        
+        # Test object features
+        obj_features = extractor.extract_object_features(dummy_frame)
+        assert obj_features.shape == (FEATURE_CONFIG['max_objects'], 5), \
+            f"Object features shape error: {obj_features.shape}"
+        
+        # Test spatial features
+        spatial_features = extractor.extract_spatial_features(dummy_frame)
+        assert spatial_features.shape == (FEATURE_CONFIG['spatial_dim'],), \
+            f"Spatial features shape error: {spatial_features.shape}"
+            
+        # Test combined features
+        features = extractor.extract_features(dummy_frame)
+        assert features['object_features'].shape == (FEATURE_CONFIG['max_objects'], 5), \
+            f"Combined object features shape error: {features['object_features'].shape}"
+        assert features['spatial_features'].shape == (FEATURE_CONFIG['spatial_dim'],), \
+            f"Combined spatial features shape error: {features['spatial_features'].shape}"
+            
+        # Test concatenated features
+        concat_features = extractor.get_concatenated_features([dummy_frame])
+        expected_dim = (FEATURE_CONFIG['max_objects'] * 5) + FEATURE_CONFIG['spatial_dim']
+        assert concat_features.shape == (1, expected_dim), \
+            f"Concatenated features shape error: {concat_features.shape}, expected (1, {expected_dim})"
+            
+        logger.info("All feature shapes verified successfully!")
+        return True
+    
+    except AssertionError as e:
+        logger.error(f"Shape verification failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error testing feature shapes: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
 def main():
     """Main function to run tests."""
     parser = argparse.ArgumentParser(description="Test YOLO feature extraction")
@@ -296,12 +353,13 @@ def main():
     parser.add_argument("--check-model", action="store_true", help="Check model capabilities")
     parser.add_argument("--validate-dims", action="store_true", help="Validate feature dimensions")
     parser.add_argument("--test-pipeline", action="store_true", help="Test full pipeline")
+    parser.add_argument("--test-shapes", action="store_true", help="Test feature shapes")
     parser.add_argument("--test-dir", type=str, help="Directory with test frames")
     
     args = parser.parse_args()
     
     # If no arguments provided, run all tests
-    if not (args.check_model or args.validate_dims or args.test_pipeline or args.test_all):
+    if not (args.check_model or args.validate_dims or args.test_pipeline or args.test_shapes or args.test_all):
         args.test_all = True
         
     success = True
@@ -318,6 +376,12 @@ def main():
         dims_ok = validate_feature_dimensions()
         logger.info(f"Dimension validation {'PASSED' if dims_ok else 'FAILED'}")
         success = success and dims_ok
+        
+    if args.test_shapes or args.test_all:
+        logger.info("=== Testing Feature Shapes ===")
+        shapes_ok = test_feature_shapes()
+        logger.info(f"Shape tests {'PASSED' if shapes_ok else 'FAILED'}")
+        success = success and shapes_ok
         
     if args.test_pipeline or args.test_all:
         logger.info("=== Testing Feature Extraction Pipeline ===")

@@ -125,8 +125,16 @@ def extract_features_from_category(input_dir, output_file, feature_config):
             # Extract features from frames
             video_features = feature_extractor.extract_features_from_frames(frames)
             
+            # Concatenate features for each frame
+            concatenated_features = feature_extractor.get_concatenated_features(frames)
+            
+            # Verify feature dimensions
+            expected_dim = (feature_config['max_objects'] * 5) + feature_config['spatial_dim']
+            if concatenated_features.shape[1] != expected_dim:
+                logging.warning(f"Feature dimension mismatch in {video_filename}! Expected {expected_dim}, got {concatenated_features.shape[1]}")
+            
             # Store features
-            all_video_features[video_filename] = video_features
+            all_video_features[video_filename] = concatenated_features
             
         except Exception as e:
             logging.error(f"Error processing {video_path}: {str(e)}")
@@ -180,8 +188,15 @@ def check_directories():
 
 def create_output_dirs():
     """Create output directories if they don't exist"""
+    # Create main feature directory
     os.makedirs(DATASET_CONFIG['feature_dir'], exist_ok=True)
-    logging.info(f"Ensured feature output directory exists: {DATASET_CONFIG['feature_dir']}")
+    
+    # Create nested feature directories for different splits
+    os.makedirs(os.path.join(DATASET_CONFIG['feature_dir'], 'train'), exist_ok=True)
+    os.makedirs(os.path.join(DATASET_CONFIG['feature_dir'], 'val'), exist_ok=True)
+    os.makedirs(os.path.join(DATASET_CONFIG['feature_dir'], 'test'), exist_ok=True)
+    
+    logging.info(f"Ensured feature output directories exist: {DATASET_CONFIG['feature_dir']}")
 
 if __name__ == "__main__":
     main()

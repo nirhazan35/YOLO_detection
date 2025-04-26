@@ -96,6 +96,8 @@ class YOLOFeatureExtractor:
             # Convert frame to RGB if it's BGR (OpenCV default)
             if frame.shape[2] == 3:  # If it has 3 channels
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Normalize to 0-1 range as required by YOLO
+                frame_rgb = frame_rgb.astype(np.float32) / 255.0
             else:
                 frame_rgb = frame
             
@@ -161,26 +163,23 @@ class YOLOFeatureExtractor:
             else:
                 frame_rgb = frame
             
-            # Convert to tensor and normalize
-            img = torch.from_numpy(frame_rgb).to(self.device)
-            img = img.permute(2, 0, 1).float() / 255.0  # HWC -> CHW
+            # Use official YOLOv11 feature extraction API
+            results = self.model.predict(frame_rgb, save_features=True)
             
-            # Add batch dimension
-            if len(img.shape) == 3:
-                img = img.unsqueeze(0)
-            
-            # Set model to evaluation mode and disable gradients
-            self.model.model.eval()
-            with torch.no_grad():
-                # Forward pass through the model's backbone and neck
-                try:
-                    # Try getting the features through the model API
-                    # Get the neck (FPN) features which are richer for spatial understanding
-                    features = self.model.model.forward_backbone(img)
-                    logging.info(f"Extracted features with shape: {[f.shape for f in features]}")
+            if not hasattr(results[0], 'features') or results[0].features is None:
+                logging.warning("YOLO results don't contain features, falling back to alternative method")
+                # Fall back to older approach
+                img = torch.from_numpy(frame_rgb).to(self.device)
+                img = img.permute(2, 0, 1).float() / 255.0  # HWC -> CHW
+                
+                # Add batch dimension
+                if len(img.shape) == 3:
+                    img = img.unsqueeze(0)
                     
-                    # Process the feature maps
-                    # Take the first feature map which has the highest resolution
+                # Set model to evaluation mode and disable gradients
+                self.model.model.eval()
+                with torch.no_grad():
+                    features = self.model.model.forward_backbone(img)
                     feature_map = features[0]  # Usually [1, C, H, W]
                     
                     # Global average pooling to reduce spatial dimensions
@@ -189,36 +188,20 @@ class YOLOFeatureExtractor:
                     
                     # Extract feature vector
                     feature_vector = pooled_features[0].cpu().numpy()  # Get the first batch item
-                    
-                    # If needed, adapt dimensions to match spatial_dim
-                    if len(feature_vector) > self.config['spatial_dim']:
-                        # Use PCA-like approach: take first N components
-                        feature_vector = feature_vector[:self.config['spatial_dim']]
-                    elif len(feature_vector) < self.config['spatial_dim']:
-                        # Pad with zeros
-                        feature_vector = np.pad(feature_vector, (0, self.config['spatial_dim'] - len(feature_vector)))
-                    
-                    return feature_vector
-                    
-                except (AttributeError, TypeError) as e:
-                    logging.warning(f"Could not access model backbone directly: {e}. Trying alternative method.")
-                    
-                    # Alternative approach: Use YOLO results for features
-                    results = self.model(img, verbose=False)
-                    if not hasattr(results[0], 'features') or results[0].features is None:
-                        raise AttributeError("YOLO results don't contain features")
-                        
-                    # Get features from YOLO results
-                    feature_vector = results[0].features.cpu().numpy()
-                    
-                    # Adapt to required dimension
-                    if len(feature_vector) > self.config['spatial_dim']:
-                        feature_vector = feature_vector[:self.config['spatial_dim']]
-                    elif len(feature_vector) < self.config['spatial_dim']:
-                        feature_vector = np.pad(feature_vector, (0, self.config['spatial_dim'] - len(feature_vector)))
-                    
-                    return feature_vector
-                    
+            else:
+                # Extract features from results
+                feature_vector = results[0].features.squeeze().cpu().numpy()
+            
+            # Adapt dimensions to match spatial_dim
+            if len(feature_vector) > self.config['spatial_dim']:
+                # Use PCA-like approach: take first N components
+                feature_vector = feature_vector[:self.config['spatial_dim']]
+            elif len(feature_vector) < self.config['spatial_dim']:
+                # Pad with zeros
+                feature_vector = np.pad(feature_vector, (0, self.config['spatial_dim'] - len(feature_vector)))
+            
+            return feature_vector
+                
         except Exception as e:
             logging.error(f"Error extracting spatial features: {str(e)}")
             logging.error(traceback.format_exc())
@@ -271,19 +254,19 @@ class YOLOFeatureExtractor:
 
     def extract_features(self, frame):
         """
-        Extract features from a single frame.
+        Extract features from a video frame.
         
         Args:
-            frame: Input image frame (BGR format from OpenCV)
+            frame: Video frame as numpy array
             
         Returns:
-            Dictionary containing object and spatial features
+            Dictionary with extracted features
         """
         try:
-            # Convert frame to RGB for YOLO processing
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Convert frame to RGB and normalize to 0-1 range
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             
-            # Extract object detection features
+            # Extract object features
             object_features = self.extract_object_features(frame_rgb)
             
             # Extract spatial features
@@ -327,8 +310,8 @@ class YOLOFeatureExtractor:
                 logger.error(f"Error processing frame {i}: {str(e)}")
                 logger.error(traceback.format_exc())
                 # Use zeros for this frame
-                all_features['object_features'].append(np.zeros((FEATURE_CONFIG['max_objects'], 5)))
-                all_features['spatial_features'].append(np.zeros(FEATURE_CONFIG['spatial_dim']))
+                all_features['object_features'].append(np.zeros((self.config['max_objects'], 5)))
+                all_features['spatial_features'].append(np.zeros(self.config['spatial_dim']))
         
         # Convert to numpy arrays
         all_features['object_features'] = np.array(all_features['object_features'])
@@ -362,17 +345,19 @@ class YOLOFeatureExtractor:
                 
                 # Concatenate object and spatial features
                 frame_features = np.concatenate([flat_object_feat, spatial_feat])
-                concatenated_features.append(frame_features)
                 
                 # Verify feature dimensions
-                expected_dim = (FEATURE_CONFIG['max_objects'] * 5) + FEATURE_CONFIG['spatial_dim']
+                expected_dim = (self.config['max_objects'] * 5) + self.config['spatial_dim']
                 if frame_features.shape[0] != expected_dim:
-                    logger.warning(f"Feature dimension mismatch! Expected {expected_dim}, got {frame_features.shape[0]}")
+                    raise ValueError(f"Feature dim mismatch! Expected {expected_dim}, got {frame_features.shape[0]}")
+                    
+                concatenated_features.append(frame_features)
+                
             except Exception as e:
                 logger.error(f"Error concatenating features for frame {i}: {str(e)}")
                 logger.error(traceback.format_exc())
                 # Use zeros for this frame
-                expected_dim = (FEATURE_CONFIG['max_objects'] * 5) + FEATURE_CONFIG['spatial_dim']
+                expected_dim = (self.config['max_objects'] * 5) + self.config['spatial_dim']
                 concatenated_features.append(np.zeros(expected_dim))
         
         return np.array(concatenated_features)
@@ -495,8 +480,18 @@ def extract_features_from_dataset(data_dir=None, output_dir=None, model_path=Non
     os.makedirs(os.path.join(output_dir, 'accidents'), exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'non_accidents'), exist_ok=True)
 
-    # Initialize feature extractor
-    extractor = YOLOFeatureExtractor(config=GPU_CONFIG)
+    # Initialize feature extractor with combined config
+    full_config = {
+        'model_path': model_path,
+        'object_classes': FEATURE_CONFIG['object_classes'],
+        'max_objects': FEATURE_CONFIG['max_objects'],
+        'spatial_dim': FEATURE_CONFIG['spatial_dim'],
+        'use_gpu': GPU_CONFIG['use_gpu'],
+        'gpu_id': GPU_CONFIG['gpu_id']
+    }
+    
+    # Create feature extractor with the full config
+    extractor = YOLOFeatureExtractor(config=full_config)
     
     # Process each category (accidents and non-accidents)
     total_processed = 0
