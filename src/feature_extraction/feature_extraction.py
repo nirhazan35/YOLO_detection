@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import logging
 import json
+import traceback
 from tqdm import tqdm
 import cv2
 from pathlib import Path
@@ -31,70 +32,262 @@ logger = logging.getLogger(__name__)
 class YOLOFeatureExtractor:
     """Extract features from video frames using YOLO11."""
     
-    def __init__(self, model_path=None, device=None):
-        """
-        Initialize the YOLO feature extractor.
-        
-        Args:
-            model_path: Path to YOLO11 weights (if None, use config value)
-            device: Computation device ('cuda' or 'cpu')
-        """
-        # Use config value if parameter is not specified
-        self.model_path = model_path if model_path else YOLO_CONFIG['model_path']
-        
-        # Set device based on config if not specified
-        if device is None:
-            if GPU_CONFIG['use_gpu'] and torch.cuda.is_available():
-                self.device = torch.device(f"cuda:{GPU_CONFIG['gpu_id']}")
-            else:
-                self.device = torch.device('cpu')
-        else:
-            self.device = torch.device(device)
-            
-        logger.info(f"Using device: {self.device}")
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device(f"cuda:{config['gpu_id']}" if config['use_gpu'] and torch.cuda.is_available() else "cpu")
         
         # Load YOLO model
         try:
-            from ultralytics import YOLO
-            self.model = YOLO(self.model_path)
-            logger.info(f"Loaded YOLO model from {self.model_path}")
-        except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
-            sys.exit(1)
+            self.model = self.load_model()
+            self.classes = self.model.names
             
-        # Classes we're interested in (from config)
-        self.target_classes = FEATURE_CONFIG['object_classes']
-        
-        # Map class names to class IDs in YOLO
-        self.class_ids = {
-            'person': 0,
-            'bicycle': 1,
-            'car': 2,
-            'motorcycle': 3,
-            'bus': 5,
-            'truck': 7
-        }
+            # Create class mapping using model names
+            self.class_map = {}
+            for i, name in self.classes.items():
+                if name in self.config['object_classes']:
+                    self.class_map[name] = i
+            
+            logging.info(f"YOLO model loaded successfully on {self.device}")
+            logging.info(f"Available classes: {self.classes}")
+            logging.info(f"Class mapping for configured classes: {self.class_map}")
+            self.model_loaded = True
+        except Exception as e:
+            logging.error(f"Failed to load YOLO model: {str(e)}")
+            logging.error(traceback.format_exc())
+            self.model_loaded = False
     
+    def load_model(self):
+        """Load the YOLO model using the ultralyticsplus API"""
+        try:
+            import torch
+            from ultralytics import YOLO
+            
+            model_path = self.config['model_path']
+            if not os.path.exists(model_path):
+                logging.error(f"Model path does not exist: {model_path}")
+                raise FileNotFoundError(f"Model file not found at {model_path}")
+            
+            # Load the model
+            logging.info(f"Loading YOLO model from {model_path}")
+            model = YOLO(model_path)
+            
+            # Move model to the appropriate device
+            model.to(self.device)
+            return model
+        except ImportError as e:
+            logging.error(f"Required packages not installed: {str(e)}")
+            raise
+        except Exception as e:
+            logging.error(f"Error loading YOLO model: {str(e)}")
+            raise
+    
+    def extract_object_features(self, frame):
+        """
+        Extract object detection features from a video frame
+        Returns a vector of detected objects with their class, confidence, and bounding box
+        """
+        if not self.model_loaded:
+            logging.warning("Could not extract YOLO11 features, returning zeros")
+            # Return zeros with the expected shape
+            # [class_id, confidence, x1, y1, width, height] for max_objects
+            return np.zeros((self.config['max_objects'], 5))
+        
+        try:
+            # Convert frame to RGB if it's BGR (OpenCV default)
+            if frame.shape[2] == 3:  # If it has 3 channels
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = frame
+            
+            # Run inference
+            results = self.model(frame_rgb, verbose=False)
+            
+            # Extract detections
+            detections = []
+            
+            if len(results) > 0:
+                # Get predictions from first result
+                result = results[0]
+                boxes = result.boxes
+                
+                # Convert boxes to desired format
+                for i, box in enumerate(boxes):
+                    cls_id = int(box.cls[0].item())
+                    cls_name = self.model.names[cls_id]
+                    
+                    # Filter by configured classes
+                    if cls_name in self.config['object_classes']:
+                        conf = box.conf[0].item()
+                        xyxy = box.xyxy[0].cpu().numpy()  # x1, y1, x2, y2
+                        
+                        # Calculate width and height from coordinates
+                        width = xyxy[2] - xyxy[0]
+                        height = xyxy[3] - xyxy[1]
+                        
+                        # Store as [class_id, confidence, x1, y1, width, height]
+                        detections.append([cls_id, conf, xyxy[0], xyxy[1], width, height])
+            
+            # Sort by confidence (highest first)
+            detections = sorted(detections, key=lambda x: x[1], reverse=True)
+            
+            # Take only the top max_objects
+            detections = detections[:self.config['max_objects']]
+            
+            # Pad with zeros if needed
+            if len(detections) < self.config['max_objects']:
+                padding = np.zeros((self.config['max_objects'] - len(detections), 5))
+                detections = np.vstack([detections, padding]) if detections else padding
+            
+            return np.array(detections)
+        
+        except Exception as e:
+            logging.error(f"Error extracting object features: {str(e)}")
+            logging.error(traceback.format_exc())
+            return np.zeros((self.config['max_objects'], 5))
+    
+    def _extract_spatial_features(self, frame):
+        """
+        Extract spatial features from a video frame using YOLO11's internal feature maps
+        Returns a feature vector representing the spatial information
+        """
+        if not self.model_loaded:
+            logging.warning("Could not extract YOLO11 features, returning zeros")
+            return np.zeros(self.config['spatial_dim'])
+        
+        try:
+            # Convert frame to RGB if it's BGR (OpenCV default)
+            if frame.shape[2] == 3:  # If it has 3 channels
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = frame
+            
+            # Convert to tensor and normalize
+            img = torch.from_numpy(frame_rgb).to(self.device)
+            img = img.permute(2, 0, 1).float() / 255.0  # HWC -> CHW
+            
+            # Add batch dimension
+            if len(img.shape) == 3:
+                img = img.unsqueeze(0)
+            
+            # Set model to evaluation mode and disable gradients
+            self.model.model.eval()
+            with torch.no_grad():
+                # Forward pass through the model's backbone and neck
+                try:
+                    # Try getting the features through the model API
+                    # Get the neck (FPN) features which are richer for spatial understanding
+                    features = self.model.model.forward_backbone(img)
+                    logging.info(f"Extracted features with shape: {[f.shape for f in features]}")
+                    
+                    # Process the feature maps
+                    # Take the first feature map which has the highest resolution
+                    feature_map = features[0]  # Usually [1, C, H, W]
+                    
+                    # Global average pooling to reduce spatial dimensions
+                    pooled_features = torch.nn.functional.adaptive_avg_pool2d(feature_map, (1, 1))
+                    pooled_features = pooled_features.view(pooled_features.size(0), -1)  # Flatten
+                    
+                    # Extract feature vector
+                    feature_vector = pooled_features[0].cpu().numpy()  # Get the first batch item
+                    
+                    # If needed, adapt dimensions to match spatial_dim
+                    if len(feature_vector) > self.config['spatial_dim']:
+                        # Use PCA-like approach: take first N components
+                        feature_vector = feature_vector[:self.config['spatial_dim']]
+                    elif len(feature_vector) < self.config['spatial_dim']:
+                        # Pad with zeros
+                        feature_vector = np.pad(feature_vector, (0, self.config['spatial_dim'] - len(feature_vector)))
+                    
+                    return feature_vector
+                    
+                except (AttributeError, TypeError) as e:
+                    logging.warning(f"Could not access model backbone directly: {e}. Trying alternative method.")
+                    
+                    # Alternative approach: Use YOLO results for features
+                    results = self.model(img, verbose=False)
+                    if not hasattr(results[0], 'features') or results[0].features is None:
+                        raise AttributeError("YOLO results don't contain features")
+                        
+                    # Get features from YOLO results
+                    feature_vector = results[0].features.cpu().numpy()
+                    
+                    # Adapt to required dimension
+                    if len(feature_vector) > self.config['spatial_dim']:
+                        feature_vector = feature_vector[:self.config['spatial_dim']]
+                    elif len(feature_vector) < self.config['spatial_dim']:
+                        feature_vector = np.pad(feature_vector, (0, self.config['spatial_dim'] - len(feature_vector)))
+                    
+                    return feature_vector
+                    
+        except Exception as e:
+            logging.error(f"Error extracting spatial features: {str(e)}")
+            logging.error(traceback.format_exc())
+            return np.zeros(self.config['spatial_dim'])
+    
+    def extract_spatial_features(self, frame):
+        """
+        Extract spatial features from a video frame
+        Returns a feature vector representing the spatial information
+        """
+        # Try using YOLO's internal features first
+        try:
+            features = self._extract_spatial_features(frame)
+            if np.any(features != 0):  # Check if features are non-zero
+                return features
+            else:
+                logging.warning("YOLO11 feature extraction returned zeros, falling back to basic method")
+        except Exception as e:
+            logging.warning(f"Failed to extract YOLO11 features: {str(e)}, falling back to basic method")
+        
+        # Fallback method if YOLO features can't be extracted
+        try:
+            # Resize to a smaller dimension
+            target_size = (self.config['spatial_dim'] // 16, self.config['spatial_dim'] // 16)
+            resized_frame = cv2.resize(frame, target_size)
+            
+            # Convert to grayscale
+            gray_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2GRAY)
+            
+            # Normalize
+            normalized = gray_frame.astype(np.float32) / 255.0
+            
+            # Flatten
+            features = normalized.flatten()
+            
+            # If needed, use PCA or other dimensionality reduction to get to spatial_dim
+            if len(features) > self.config['spatial_dim']:
+                # Simple approach: subsample
+                indices = np.linspace(0, len(features)-1, self.config['spatial_dim']).astype(int)
+                features = features[indices]
+            elif len(features) < self.config['spatial_dim']:
+                # Pad with zeros
+                features = np.pad(features, (0, self.config['spatial_dim'] - len(features)))
+            
+            return features
+        except Exception as e:
+            logging.error(f"Error in fallback spatial feature extraction: {str(e)}")
+            logging.error(traceback.format_exc())
+            return np.zeros(self.config['spatial_dim'])
+
     def extract_features(self, frame):
         """
         Extract features from a single frame.
         
         Args:
-            frame: Input image frame
+            frame: Input image frame (BGR format from OpenCV)
             
         Returns:
             Dictionary containing object and spatial features
         """
         try:
-            # Run inference with YOLO
-            with torch.no_grad():
-                results = self.model(frame, verbose=False)
-                
+            # Convert frame to RGB for YOLO processing
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
             # Extract object detection features
-            object_features = self._extract_object_features(results[0])
+            object_features = self.extract_object_features(frame_rgb)
             
             # Extract spatial features
-            spatial_features = self._extract_spatial_features(results[0])
+            spatial_features = self.extract_spatial_features(frame_rgb)
             
             return {
                 'object_features': object_features,
@@ -103,146 +296,12 @@ class YOLOFeatureExtractor:
             
         except Exception as e:
             logger.error(f"Error extracting features: {e}")
+            logger.error(traceback.format_exc())
             # Return empty features if extraction fails
             return {
-                'object_features': np.zeros((FEATURE_CONFIG['max_objects'], 5)),  # max_objects, 5 features each
-                'spatial_features': np.zeros(FEATURE_CONFIG['spatial_dim'])       # spatial_dim features
+                'object_features': np.zeros((self.config['max_objects'], 5)),  # max_objects, 5 features each
+                'spatial_features': np.zeros(self.config['spatial_dim'])       # spatial_dim features
             }
-    
-    def _extract_object_features(self, result):
-        """
-        Extract object detection features (bounding boxes and classes).
-        
-        Args:
-            result: YOLO detection result for a single frame
-            
-        Returns:
-            Numpy array of object features
-        """
-        # Initialize empty array for object features
-        # Each object: [x, y, width, height, class_probability]
-        max_objects = FEATURE_CONFIG['max_objects']
-        object_features = np.zeros((max_objects, 5))  # max_objects, 5 features each
-        
-        try:
-            # Get detections
-            boxes = result.boxes
-            
-            if len(boxes) == 0:
-                return object_features
-            
-            # Get normalized bounding box coordinates [x, y, width, height]
-            xywhn = boxes.xywhn.cpu().numpy()
-            
-            # Get class IDs and probabilities
-            cls = boxes.cls.cpu().numpy()
-            conf = boxes.conf.cpu().numpy()
-            
-            # Filter for target classes and sort by confidence
-            valid_detections = []
-            
-            for i in range(len(boxes)):
-                class_id = int(cls[i])
-                class_name = result.names[class_id]
-                
-                if class_name in self.target_classes:
-                    valid_detections.append({
-                        'bbox': xywhn[i],
-                        'class_id': class_id,
-                        'confidence': conf[i]
-                    })
-            
-            # Sort by confidence (highest first)
-            valid_detections.sort(key=lambda x: x['confidence'], reverse=True)
-            
-            # Take top N detections (where N is max_objects)
-            for i in range(min(max_objects, len(valid_detections))):
-                detection = valid_detections[i]
-                
-                # Store bbox coordinates and class probability
-                object_features[i, 0:4] = detection['bbox']
-                object_features[i, 4] = detection['confidence']
-                
-            return object_features
-            
-        except Exception as e:
-            logger.error(f"Error extracting object features: {e}")
-            return object_features
-    
-    def _extract_spatial_features(self, result):
-        """
-        Extract spatial features from YOLO's backbone.
-        
-        Args:
-            result: YOLO detection result for a single frame
-            
-        Returns:
-            Numpy array of spatial features
-        """
-        spatial_dim = FEATURE_CONFIG['spatial_dim']
-        
-        try:
-            # Get feature maps from the backbone directly with YOLO11
-            if hasattr(self.model, 'model') and hasattr(self.model.model, 'backbone'):
-                # Get the input image tensor
-                with torch.no_grad():
-                    img_tensor = torch.from_numpy(result.orig_img).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
-                    img_tensor = img_tensor.to(self.device)
-                    
-                    # Pass through model backbone
-                    features = self.model.model.backbone(img_tensor)
-                    
-                    # Get the feature map from the last layer (YOLO11 specific)
-                    if isinstance(features, list) or isinstance(features, tuple):
-                        features = features[-1]  # Take the deepest feature map
-                    
-                    # Apply global average pooling to get a fixed-size feature vector
-                    features = torch.nn.functional.adaptive_avg_pool2d(features, (1, 1))
-                    features = features.reshape(features.size(0), -1)  # Flatten
-                    
-                    # Convert to numpy and ensure spatial_dim dimensions
-                    features_np = features.cpu().numpy()[0]
-                    
-                    if features_np.size >= spatial_dim:
-                        return features_np[:spatial_dim]
-                    else:
-                        # Pad with zeros if smaller
-                        padded = np.zeros(spatial_dim)
-                        padded[:features_np.size] = features_np
-                        return padded
-            
-            # Alternative: extract prototypes/feature vectors if available in YOLO11
-            elif hasattr(result, 'probs') and result.probs is not None:
-                features = result.probs.cpu().numpy()
-                
-                if features.size >= spatial_dim:
-                    return features.flatten()[:spatial_dim]
-                else:
-                    padded = np.zeros(spatial_dim)
-                    padded[:features.size] = features.flatten()
-                    return padded
-            
-            # Another approach: try to access internal tensors from proto/feature outputs
-            elif hasattr(result, 'proto') and result.proto is not None:
-                proto = result.proto.cpu().numpy()
-                # Reshape and process proto features
-                proto_flat = proto.reshape(proto.shape[0], -1)
-                
-                if proto_flat.size >= spatial_dim:
-                    return proto_flat[:spatial_dim]
-                else:
-                    padded = np.zeros(spatial_dim)
-                    padded[:proto_flat.size] = proto_flat
-                    return padded
-            
-            # If all else fails, return zeros
-            else:
-                logger.warning("Could not extract YOLO11 features, returning zeros")
-                return np.zeros(spatial_dim)
-                
-        except Exception as e:
-            logger.error(f"Error extracting spatial features: {e}")
-            return np.zeros(spatial_dim)
     
     def extract_features_from_frames(self, frames):
         """
@@ -259,10 +318,17 @@ class YOLOFeatureExtractor:
             'spatial_features': []
         }
         
-        for frame in frames:
-            features = self.extract_features(frame)
-            all_features['object_features'].append(features['object_features'])
-            all_features['spatial_features'].append(features['spatial_features'])
+        for i, frame in enumerate(frames):
+            try:
+                features = self.extract_features(frame)
+                all_features['object_features'].append(features['object_features'])
+                all_features['spatial_features'].append(features['spatial_features'])
+            except Exception as e:
+                logger.error(f"Error processing frame {i}: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Use zeros for this frame
+                all_features['object_features'].append(np.zeros((FEATURE_CONFIG['max_objects'], 5)))
+                all_features['spatial_features'].append(np.zeros(FEATURE_CONFIG['spatial_dim']))
         
         # Convert to numpy arrays
         all_features['object_features'] = np.array(all_features['object_features'])
@@ -286,16 +352,28 @@ class YOLOFeatureExtractor:
         concatenated_features = []
         
         for i in range(num_frames):
-            # Get features for this frame
-            object_feat = features['object_features'][i]
-            spatial_feat = features['spatial_features'][i]
-            
-            # Flatten object features (max_objects * 5 features)
-            flat_object_feat = object_feat.flatten()
-            
-            # Concatenate object and spatial features
-            frame_features = np.concatenate([flat_object_feat, spatial_feat])
-            concatenated_features.append(frame_features)
+            try:
+                # Get features for this frame
+                object_feat = features['object_features'][i]
+                spatial_feat = features['spatial_features'][i]
+                
+                # Flatten object features (max_objects * 5 features)
+                flat_object_feat = object_feat.flatten()
+                
+                # Concatenate object and spatial features
+                frame_features = np.concatenate([flat_object_feat, spatial_feat])
+                concatenated_features.append(frame_features)
+                
+                # Verify feature dimensions
+                expected_dim = (FEATURE_CONFIG['max_objects'] * 5) + FEATURE_CONFIG['spatial_dim']
+                if frame_features.shape[0] != expected_dim:
+                    logger.warning(f"Feature dimension mismatch! Expected {expected_dim}, got {frame_features.shape[0]}")
+            except Exception as e:
+                logger.error(f"Error concatenating features for frame {i}: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Use zeros for this frame
+                expected_dim = (FEATURE_CONFIG['max_objects'] * 5) + FEATURE_CONFIG['spatial_dim']
+                concatenated_features.append(np.zeros(expected_dim))
         
         return np.array(concatenated_features)
 
@@ -317,6 +395,8 @@ def load_frames(frame_dir):
         frame = cv2.imread(frame_path)
         if frame is not None:
             frames.append(frame)
+        else:
+            logger.warning(f"Could not read frame: {frame_path}")
     
     return frames
 
@@ -346,6 +426,8 @@ def process_split(split_dir, extractor, output_dir):
     
     # Process each video
     count = 0
+    errors = 0
+    
     for frame_dir in tqdm(frame_dirs, desc=f"Processing {os.path.basename(split_dir)}"):
         video_name = os.path.basename(frame_dir).replace('_frames', '')
         
@@ -364,10 +446,23 @@ def process_split(split_dir, extractor, output_dir):
             output_path = os.path.join(output_dir, f"{video_name}_features.npy")
             np.save(output_path, features)
             
-            count += 1
+            # Verify the saved file
+            if os.path.exists(output_path):
+                feature_shape = features.shape
+                logger.info(f"Saved features for {video_name} with shape {feature_shape}")
+                count += 1
+            else:
+                logger.error(f"Failed to save features for {video_name}")
+                errors += 1
+                
         except Exception as e:
             logger.error(f"Error processing {frame_dir}: {e}")
+            logger.error(traceback.format_exc())
+            errors += 1
     
+    if errors > 0:
+        logger.warning(f"Completed with {errors} errors out of {len(frame_dirs)} videos")
+        
     return count
 
 def extract_features_from_dataset(data_dir=None, output_dir=None, model_path=None, device=None):
@@ -401,7 +496,7 @@ def extract_features_from_dataset(data_dir=None, output_dir=None, model_path=Non
     os.makedirs(os.path.join(output_dir, 'non_accidents'), exist_ok=True)
 
     # Initialize feature extractor
-    extractor = YOLOFeatureExtractor(model_path=model_path, device=device)
+    extractor = YOLOFeatureExtractor(config=GPU_CONFIG)
     
     # Process each category (accidents and non-accidents)
     total_processed = 0

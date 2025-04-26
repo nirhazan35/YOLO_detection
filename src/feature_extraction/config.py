@@ -12,6 +12,16 @@ FEATURE_CONFIG = {
     'spatial_dim': 256  # Dimension of spatial features
 }
 
+# Dataset parameters
+DATASET_CONFIG = {
+    'accident_dir': './data/processed/accidents',
+    'non_accident_dir': './data/processed/non_accidents',
+    'feature_dir': './data/features',
+    'train_split': 0.7,
+    'val_split': 0.15,
+    'test_split': 0.15
+}
+
 # GPU settings
 GPU_CONFIG = {
     'use_gpu': True,
