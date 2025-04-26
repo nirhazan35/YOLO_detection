@@ -19,7 +19,7 @@ from data_processing.data_preprocessing import (
     check_gpu_availability
 )
 from data_processing.optical_flow import compute_optical_flow, save_optical_flow_frames
-from data_processing.data_validation import validate_processed_data
+from data_processing.data_validation import validate_processed_data, validate_rgb_flow_pair
 
 # Configure logging
 logging.basicConfig(
@@ -146,6 +146,11 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
             use_gpu=use_gpu
         )
         
+        # Validate consistency between RGB frames and optical flow
+        is_consistent, error_msg = validate_rgb_flow_pair(frames, flow_frames)
+        if not is_consistent:
+            logger.warning(f"RGB-flow consistency check failed: {error_msg}. Will try to continue anyway.")
+        
         # Step 3: Save frames and flow
         for i, frame in enumerate(frames):
             cv2.imwrite(os.path.join(frames_output_dir, f"frame_{i:02d}.jpg"), frame)
@@ -156,13 +161,20 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
             video_name
         )
         
-        # Save metadata
+        # Save metadata including processing parameters
         metadata = {
             'original_path': video_path,
             'label': label,
             'frames_count': len(frames),
             'flow_frames_count': len(flow_frames),
-            'processed_date': time.strftime('%Y-%m-%d %H:%M:%S')
+            'processed_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'processing_config': {
+                'resolution': config['target_resolution'],
+                'fps': config['target_fps'],
+                'content_aware': config['content_aware_sampling'],
+                'flow_method': 'raft' if 'raft' in str(flow_frames).lower() else 'standard'
+            },
+            'split': None  # Will be assigned later in the pipeline
         }
         
         with open(metadata_path, 'w') as f:
@@ -202,11 +214,11 @@ def save_progress(output_dir, processed_videos, failed_videos):
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     
-    progress_path = os.path.join(output_dir, 'progress.json')
-    with open(progress_path, 'w') as f:
-        json.dump(progress, f, indent=2)
+    progress_file = os.path.join(output_dir, 'progress.json')
+    with open(progress_file, 'w') as f:
+        json.dump(progress, f, indent=4)
     
-    logger.info(f"Saved progress: {len(processed_videos)} processed, {len(failed_videos)} failed")
+    logger.info(f"Saved progress to {progress_file}")
 
 def load_progress(output_dir):
     """
@@ -216,42 +228,32 @@ def load_progress(output_dir):
         output_dir: Base output directory
         
     Returns:
-        Progress dictionary or None if not found
+        Tuple of (processed_videos, failed_videos)
     """
-    progress_path = os.path.join(output_dir, 'progress.json')
-    if os.path.exists(progress_path):
-        try:
-            with open(progress_path, 'r') as f:
-                progress = json.load(f)
-            logger.info(f"Loaded progress from {progress['timestamp']}")
-            return progress
-        except Exception as e:
-            logger.error(f"Error loading progress: {e}")
+    progress_file = os.path.join(output_dir, 'progress.json')
     
-    return None
+    if not os.path.exists(progress_file):
+        logger.info("No progress file found, starting from scratch")
+        return [], []
+    
+    try:
+        with open(progress_file, 'r') as f:
+            progress = json.load(f)
+        
+        processed_videos = progress.get('processed_videos', [])
+        failed_videos = progress.get('failed_videos', [])
+        
+        logger.info(f"Loaded progress: {len(processed_videos)} processed, {len(failed_videos)} failed")
+        
+        return processed_videos, failed_videos
+    except Exception as e:
+        logger.error(f"Error loading progress: {e}")
+        return [], []
 
 def create_dataset():
-    """
-    Process all videos sequentially to create the dataset.
-    Using configuration parameters from config.py.
-    """
-    logger.info("Starting dataset creation...")
-    
-    # Set random seed
+    """Main function to create the dataset."""
+    # Set random seed for reproducibility
     set_random_seed(RANDOM_SEED)
-    
-    # Check GPU availability
-    device = check_gpu_availability()
-    use_gpu = (device.type == 'cuda')
-    
-    # Configure GPU device if specified
-    if use_gpu and torch.cuda.is_available():
-        try:
-            torch.cuda.set_device(0)
-            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        except Exception as e:
-            logger.warning(f"Failed to set GPU device: {e}")
-            use_gpu = False
     
     # Create output directories
     os.makedirs(DATA_PATH['processed_parent'], exist_ok=True)
@@ -261,80 +263,54 @@ def create_dataset():
     # Get video paths
     video_paths = get_video_paths(DATA_PATH['accidents'], DATA_PATH['non_accidents'])
     
-    # Combine all videos
-    all_videos = {
-        'accident': video_paths['accident'],
-        'non_accident': video_paths['non_accident']
-    }
-    
-    logger.info(f"Total videos to process: {len(all_videos['accident'])} accident, {len(all_videos['non_accident'])} non-accident")
-    
-    # Save dataset information
-    with open(os.path.join(DATA_PATH['processed_parent'], 'dataset_info.json'), 'w') as f:
-        json.dump({
-            'accident': len(all_videos['accident']),
-            'non_accident': len(all_videos['non_accident']),
-            'total': len(all_videos['accident']) + len(all_videos['non_accident'])
-        }, f, indent=2)
-    
-    # Create processing queue
-    processing_queue = []
-    for label in all_videos:
-        for i, video_path in enumerate(all_videos[label]):
-            video_idx = i + 1  # 1-based index
-            processing_queue.append((video_path, label, video_idx, VIDEO_CONFIG, use_gpu))
-    
     # Load progress if exists
-    progress = load_progress(DATA_PATH['processed_parent'])
-    processed_videos = []
-    failed_videos = []
+    processed_videos, failed_videos = load_progress(DATA_PATH['processed_parent'])
     
-    if progress:
-        processed_videos = progress['processed_videos']
-        failed_videos = progress['failed_videos']
-        logger.info(f"Resuming from previous progress: {len(processed_videos)} already processed")
+    # Check if GPU is available
+    device = check_gpu_availability()
+    use_gpu = device.type == 'cuda'
     
-    # Process videos sequentially
-    for idx, (video_path, label, video_idx, config, use_gpu) in enumerate(processing_queue):
-        # Skip already processed videos
-        if video_path in processed_videos:
-            logger.info(f"Skipping already processed video: {video_path}")
-            continue
-        
-        logger.info(f"Processing video {idx+1}/{len(processing_queue)}: {video_path}")
-        
-        success = process_video(video_path, label, video_idx, config, use_gpu)
-        if success:
-            processed_videos.append(video_path)
-            logger.info(f"Successfully processed: {video_path}")
-        else:
-            failed_videos.append(video_path)
-            logger.error(f"Failed to process: {video_path}")
-        
-        # Save progress every 5 videos
-        if (idx + 1) % 5 == 0:
-            save_progress(DATA_PATH['processed_parent'], processed_videos, failed_videos)
+    # Process videos
+    for label, paths in video_paths.items():
+        for i, video_path in enumerate(paths):
+            # Skip if already processed
+            if video_path in processed_videos:
+                logger.info(f"Skipping already processed video: {video_path}")
+                continue
+            
+            # Skip if already failed
+            if video_path in failed_videos:
+                logger.info(f"Skipping previously failed video: {video_path}")
+                continue
+            
+            # Process the video
+            logger.info(f"Processing {label} video {i+1}/{len(paths)}: {video_path}")
+            success = process_video(
+                video_path, 
+                label, 
+                i, 
+                VIDEO_CONFIG,
+                use_gpu=use_gpu
+            )
+            
+            if success:
+                processed_videos.append(video_path)
+                logger.info(f"Successfully processed video: {video_path}")
+            else:
+                failed_videos.append(video_path)
+                logger.error(f"Failed to process video: {video_path}")
+            
+            # Save progress periodically
+            if (i + 1) % 10 == 0:
+                save_progress(DATA_PATH['processed_parent'], processed_videos, failed_videos)
     
-    # Final report
-    logger.info(f"Dataset creation completed. Processed {len(processed_videos)} videos successfully.")
-    if failed_videos:
-        logger.warning(f"Failed to process {len(failed_videos)} videos.")
-        with open(os.path.join(DATA_PATH['processed_parent'], 'failed_videos.json'), 'w') as f:
-            json.dump(failed_videos, f, indent=2)
+    # Save final progress
+    save_progress(DATA_PATH['processed_parent'], processed_videos, failed_videos)
     
-    # Create final success report
-    success_report = {
-        'total_videos': len(processing_queue),
-        'processed_videos': len(processed_videos),
-        'failed_videos': len(failed_videos),
-        'success_rate': len(processed_videos) / len(processing_queue) if processing_queue else 0,
-        'processing_time': time.strftime('%Y-%m-%d %H:%M:%S')
-    }
+    # Print summary
+    logger.info(f"Dataset creation complete. Processed {len(processed_videos)} videos, failed {len(failed_videos)} videos.")
     
-    with open(os.path.join(DATA_PATH['processed_parent'], 'processing_report.json'), 'w') as f:
-        json.dump(success_report, f, indent=2)
-    
-    logger.info(f"Dataset creation report saved to {os.path.join(DATA_PATH['processed_parent'], 'processing_report.json')}")
+    return processed_videos, failed_videos
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     create_dataset()

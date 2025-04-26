@@ -27,7 +27,11 @@ VIDEO_CONFIG = {
     'target_resolution': (640, 480),  # Width, height
     'target_fps': 15,                 # Frames per second
     'clip_duration': 4,               # seconds
-    'num_frames': 16                  # Extract 16 frames per video
+    'num_frames': 16,                 # Extract 16 frames per video
+    'max_video_length': 60,           # Maximum video length to process in seconds
+    'temporal_subsampling': True,     # Whether to apply temporal subsampling for long videos
+    'content_aware_sampling': True,   # Whether to use content-aware frame selection
+    'motion_threshold': 0.05         # Minimum normalized motion for content-aware selection
 }
 
 # Data split
@@ -47,13 +51,26 @@ PARALLEL_PROCESSING = {
 # GPU settings
 GPU_CONFIG = {
     'use_gpu': None,                 # None for auto-detection, True to force GPU, False to force CPU
-    'gpu_id': 0                      # Used if multiple GPUs are available
+    'gpu_id': 0,                     # Used if multiple GPUs are available
+    'prefer_raft': True              # Whether to prefer RAFT optical flow when available
+}
+
+# Optical flow settings
+OPTICAL_FLOW = {
+    'method': 'auto',                # 'auto', 'raft', 'dis', or 'farneback'
+    'farneback_levels': 3,           # Number of pyramid levels for Farneback
+    'farneback_winsize': 15,         # Window size for Farneback
+    'dis_preset': 'medium',          # DIS preset: 'fast', 'medium', or 'accurate'
+    'visualize_flow': True           # Whether to save flow visualization images
 }
 
 # Validation thresholds
 VALIDATION = {
     'frame_variance_threshold': 10,  # Minimum variance for a valid frame
-    'sequence_validity_ratio': 0.75  # Minimum ratio of valid frames for a valid sequence
+    'sequence_validity_ratio': 0.75, # Minimum ratio of valid frames for a valid sequence
+    'motion_consistency_check': True, # Check consistency between RGB and flow frames
+    'frozen_frame_threshold': 3.0,   # Threshold for detecting frozen frames (L2 difference)
+    'max_consecutive_frozen': 3      # Maximum allowed consecutive frozen frames
 }
 
 # Random seed for reproducibility

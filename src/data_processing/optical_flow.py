@@ -13,6 +13,34 @@ from data_processing.config import PARALLEL_PROCESSING, GPU_CONFIG
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def compute_optical_flow_raft(prev, curr):
+    """
+    Compute optical flow using RAFT algorithm (more accurate than Farneback/DIS).
+    
+    Args:
+        prev: Previous frame (grayscale)
+        curr: Current frame (grayscale)
+        
+    Returns:
+        Optical flow field
+    """
+    try:
+        # Convert grayscale to BGR if needed for RAFT
+        if len(prev.shape) == 2:
+            prev = cv2.cvtColor(prev, cv2.COLOR_GRAY2BGR)
+        if len(curr.shape) == 2:
+            curr = cv2.cvtColor(curr, cv2.COLOR_GRAY2BGR)
+            
+        # Create RAFT optical flow object
+        raft = cv2.optflow.createOptFlow_RAFT()
+        
+        # Calculate flow
+        flow = raft.calc(prev, curr, None)
+        return flow
+    except Exception as e:
+        logger.error(f"RAFT optical flow error: {e}")
+        return None
+
 def compute_optical_flow(frames, use_gpu=None, batch_size=None):
     """
     Compute optical flow between consecutive frames.
@@ -40,8 +68,19 @@ def compute_optical_flow(frames, use_gpu=None, batch_size=None):
         if use_gpu is None:
             use_gpu = torch.cuda.is_available()
     
+    # Check for RAFT availability first (preferred method)
+    use_raft = False
+    try:
+        # Test if OpenCV has RAFT implementation
+        cv2.optflow.createOptFlow_RAFT()
+        use_raft = True
+        logger.info("Using RAFT optical flow algorithm (high accuracy)")
+    except:
+        logger.warning("RAFT optical flow not available, falling back to alternative methods")
+        use_raft = False
+    
     # Use CUDA if available and requested
-    if use_gpu and torch.cuda.is_available():
+    if use_gpu and torch.cuda.is_available() and not use_raft:
         try:
             # Try to use GPU-based flow algorithm (DIS or DenseRLOF)
             flow_algorithm = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
@@ -49,10 +88,8 @@ def compute_optical_flow(frames, use_gpu=None, batch_size=None):
         except:
             logger.warning("GPU-accelerated optical flow not available, falling back to CPU")
             use_gpu = False
-    else:
+    elif not use_raft:
         use_gpu = False
-        
-    if not use_gpu:
         logger.info("Using CPU-based optical flow with Farneback algorithm")
     
     flow_frames = []
@@ -60,11 +97,14 @@ def compute_optical_flow(frames, use_gpu=None, batch_size=None):
     # Add a zero flow for the first frame
     flow_frames.append(np.zeros_like(frames[0]))
     
-    # Convert all frames to grayscale first to save memory
+    # Convert all frames to grayscale first to save memory (only if not using RAFT)
     gray_frames = []
-    for frame in frames:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_frames.append(gray)
+    if not use_raft:
+        for frame in frames:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_frames.append(gray)
+    else:
+        gray_frames = frames  # RAFT uses color images
     
     # Process in batches to manage memory
     for batch_start in range(0, len(frames)-1, batch_size):
@@ -72,20 +112,28 @@ def compute_optical_flow(frames, use_gpu=None, batch_size=None):
         batch_flow_frames = []
         
         for i in range(batch_start, batch_end):
-            prev_gray = gray_frames[i]
-            curr_gray = gray_frames[i+1]
+            prev = gray_frames[i]
+            curr = gray_frames[i+1]
             
             try:
-                if use_gpu:
+                if use_raft:
+                    # Use RAFT algorithm
+                    flow = compute_optical_flow_raft(prev, curr)
+                elif use_gpu:
                     # Use GPU algorithm
-                    flow = flow_algorithm.calc(prev_gray, curr_gray, None)
+                    flow = flow_algorithm.calc(prev, curr, None)
                 else:
                     # Use Farneback on CPU
                     flow = cv2.calcOpticalFlowFarneback(
-                        prev_gray, curr_gray, None, 
+                        prev, curr, None, 
                         pyr_scale=0.5, levels=3, winsize=15, 
                         iterations=3, poly_n=5, poly_sigma=1.2, flags=0
                     )
+                
+                if flow is None:
+                    # If flow calculation failed, use zero flow
+                    logger.warning(f"Flow calculation failed for frames {i} and {i+1}")
+                    flow = np.zeros((frames[0].shape[0], frames[0].shape[1], 2), dtype=np.float32)
                 
                 # Convert flow to RGB visualization
                 magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])

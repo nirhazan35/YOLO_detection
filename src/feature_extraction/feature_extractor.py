@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from typing import List, Tuple, Dict, Union, Optional
+import torch.nn as nn
 
 class YOLO11FeatureExtractor:
     """
@@ -93,6 +94,7 @@ class YOLO11FeatureExtractor:
         Returns:
             Object features as numpy array with shape (max_objects * 5,)
             Each object has 5 values: [x, y, width, height, class_probability]
+            Plus additional relative positioning features between objects
         """
         # Get normalized bounding boxes (xywh format, values 0-1)
         if hasattr(result.boxes, 'xywhn') and len(result.boxes) > 0:
@@ -132,7 +134,7 @@ class YOLO11FeatureExtractor:
             sorted_confidences = np.zeros(0)
         
         # Initialize feature array with zeros
-        # Each object has 5 values: x, y, w, h, confidence
+        # Base object features: x, y, w, h, confidence
         object_features = np.zeros(self.max_objects * self.obj_feature_dim)
         
         # Fill in detected objects
@@ -146,7 +148,179 @@ class YOLO11FeatureExtractor:
             object_features[start_idx:start_idx+4] = [x, y, w, h]
             object_features[start_idx+4] = conf
         
+        # Calculate relative positioning features if we have more than one object
+        if len(sorted_boxes) > 1:
+            rel_pos_features = self._calculate_relative_positions(sorted_boxes)
+            
+            # Append these to the object_features array if there's room
+            # We need to ensure we're still returning exactly max_objects * obj_feature_dim
+            # So we'll replace some of the empty padding with useful relational features
+            if len(sorted_boxes) < self.max_objects:
+                # Calculate how many unused entries we have in the feature vector
+                unused_entries = (self.max_objects - len(sorted_boxes)) * self.obj_feature_dim
+                
+                # Use up to that many entries for relational features
+                rel_features_to_use = min(unused_entries, len(rel_pos_features))
+                if rel_features_to_use > 0:
+                    # Start filling from the end of the actual object features
+                    start_idx = len(sorted_boxes) * self.obj_feature_dim
+                    object_features[start_idx:start_idx+rel_features_to_use] = rel_pos_features[:rel_features_to_use]
+        
         return object_features
+    
+    def _calculate_relative_positions(self, boxes: np.ndarray) -> np.ndarray:
+        """
+        Calculate relative positioning features between objects.
+        
+        Args:
+            boxes: Array of bounding boxes in xywh format (normalized)
+            
+        Returns:
+            Array of relative positioning features
+        """
+        num_boxes = len(boxes)
+        features = []
+        
+        # Skip if less than 2 boxes
+        if num_boxes < 2:
+            return np.array([])
+        
+        for i in range(num_boxes):
+            box1_x, box1_y, box1_w, box1_h = boxes[i]
+            box1_center = np.array([box1_x, box1_y])
+            
+            for j in range(i + 1, num_boxes):
+                box2_x, box2_y, box2_w, box2_h = boxes[j]
+                box2_center = np.array([box2_x, box2_y])
+                
+                # Calculate distance between centers (Euclidean)
+                distance = np.linalg.norm(box1_center - box2_center)
+                
+                # Calculate angle between centers
+                angle = np.arctan2(box2_y - box1_y, box2_x - box1_x)
+                
+                # Calculate size ratio
+                area1 = box1_w * box1_h
+                area2 = box2_w * box2_h
+                size_ratio = area1 / (area2 + 1e-6)  # Avoid division by zero
+                
+                # Calculate overlap ratio
+                x_overlap = max(0, min(box1_x + box1_w/2, box2_x + box2_w/2) - max(box1_x - box1_w/2, box2_x - box2_w/2))
+                y_overlap = max(0, min(box1_y + box1_h/2, box2_y + box2_h/2) - max(box1_y - box1_h/2, box2_y - box2_h/2))
+                intersection = x_overlap * y_overlap
+                union = area1 + area2 - intersection
+                iou = intersection / (union + 1e-6)  # Intersection over Union
+                
+                # Add these features
+                features.extend([distance, angle, size_ratio, iou])
+        
+        return np.array(features)
+    
+    def extract_trajectory_features(self, frames_results, window_size=5):
+        """
+        Extract trajectory features from a sequence of frame results.
+        
+        Args:
+            frames_results: List of YOLO detection results from consecutive frames
+            window_size: Number of frames to consider for trajectory
+            
+        Returns:
+            Trajectory features as numpy array
+        """
+        num_frames = len(frames_results)
+        if num_frames < 2:
+            return np.zeros(self.max_objects * 4)  # 4 values per object: dx, dy, speed, angle
+        
+        # We'll focus on the window_size most recent frames
+        start_idx = max(0, num_frames - window_size)
+        recent_results = frames_results[start_idx:]
+        
+        # Track objects across frames using simple IoU matching
+        trajectories = []
+        
+        # Extract boxes from all frames first
+        all_boxes = []
+        all_classes = []
+        all_confidences = []
+        
+        for result in recent_results:
+            if hasattr(result.boxes, 'xywhn') and len(result.boxes) > 0:
+                boxes = result.boxes.xywhn.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy()
+                confidences = result.boxes.conf.cpu().numpy()
+                
+                # Filter for road-related classes
+                road_indices = [i for i, cls in enumerate(classes) if int(cls) in self.ROAD_CLASSES]
+                
+                filtered_boxes = boxes[road_indices] if road_indices else np.zeros((0, 4))
+                filtered_classes = classes[road_indices] if road_indices else np.zeros(0)
+                filtered_confidences = confidences[road_indices] if road_indices else np.zeros(0)
+                
+                # Sort by confidence
+                if len(filtered_confidences) > 0:
+                    sort_idx = np.argsort(-filtered_confidences)
+                    sorted_boxes = filtered_boxes[sort_idx][:self.max_objects]
+                    sorted_classes = filtered_classes[sort_idx][:self.max_objects]
+                else:
+                    sorted_boxes = np.zeros((0, 4))
+                    sorted_classes = np.zeros(0)
+                
+                all_boxes.append(sorted_boxes)
+                all_classes.append(sorted_classes)
+            else:
+                all_boxes.append(np.zeros((0, 4)))
+                all_classes.append(np.zeros(0))
+        
+        # Calculate trajectory features for each object
+        trajectory_features = np.zeros(self.max_objects * 4)  # dx, dy, speed, angle
+        
+        # For simplicity, we'll just look at displacement between first and last frame
+        if len(all_boxes) >= 2 and len(all_boxes[0]) > 0 and len(all_boxes[-1]) > 0:
+            first_boxes = all_boxes[0]
+            last_boxes = all_boxes[-1]
+            
+            # Match objects between first and last frame using IoU
+            for i, first_box in enumerate(first_boxes):
+                if i >= self.max_objects:
+                    break
+                    
+                best_match = -1
+                best_iou = 0.3  # IoU threshold
+                
+                for j, last_box in enumerate(last_boxes):
+                    # Calculate IoU between boxes
+                    x_overlap = max(0, min(first_box[0] + first_box[2]/2, last_box[0] + last_box[2]/2) - 
+                                    max(first_box[0] - first_box[2]/2, last_box[0] - last_box[2]/2))
+                    y_overlap = max(0, min(first_box[1] + first_box[3]/2, last_box[1] + last_box[3]/2) - 
+                                    max(first_box[1] - first_box[3]/2, last_box[1] - last_box[3]/2))
+                    
+                    intersection = x_overlap * y_overlap
+                    area1 = first_box[2] * first_box[3]
+                    area2 = last_box[2] * last_box[3]
+                    union = area1 + area2 - intersection
+                    iou = intersection / (union + 1e-6)
+                    
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_match = j
+                
+                # If we found a match, calculate trajectory features
+                if best_match != -1:
+                    matched_box = last_boxes[best_match]
+                    
+                    # Calculate displacement
+                    dx = matched_box[0] - first_box[0]
+                    dy = matched_box[1] - first_box[1]
+                    
+                    # Calculate speed and angle
+                    speed = np.sqrt(dx*dx + dy*dy)
+                    angle = np.arctan2(dy, dx)
+                    
+                    # Store features
+                    feature_idx = i * 4
+                    trajectory_features[feature_idx:feature_idx+4] = [dx, dy, speed, angle]
+        
+        return trajectory_features
     
     def _extract_spatial_features(self, result) -> np.ndarray:
         """
@@ -345,4 +519,146 @@ class YOLO11FeatureExtractor:
             frame_features = self.extract_features(frame)
             features.append(frame_features)
         
-        return np.array(features) 
+        return np.array(features)
+
+class CrossModalFusion:
+    """
+    Cross-modal fusion between RGB and flow features with attention mechanism.
+    """
+    def __init__(self, rgb_dim=281, flow_dim=128, fused_dim=409, use_gpu=None):
+        """
+        Initialize the cross-modal fusion module.
+        
+        Args:
+            rgb_dim: Dimension of RGB features
+            flow_dim: Dimension of flow features
+            fused_dim: Dimension of fused features
+            use_gpu: Whether to use GPU if available
+        """
+        self.rgb_dim = rgb_dim
+        self.flow_dim = flow_dim
+        self.fused_dim = fused_dim
+        
+        # Determine device
+        if use_gpu is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        
+        # Attention networks
+        self.rgb_attention = nn.Sequential(
+            nn.Linear(rgb_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, flow_dim),
+            nn.Sigmoid()
+        ).to(self.device)
+        
+        self.flow_attention = nn.Sequential(
+            nn.Linear(flow_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, rgb_dim),
+            nn.Sigmoid()
+        ).to(self.device)
+        
+        # Feature normalization layers
+        self.rgb_norm = nn.LayerNorm(rgb_dim).to(self.device)
+        self.flow_norm = nn.LayerNorm(flow_dim).to(self.device)
+        
+        # Final fusion layer
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(rgb_dim + flow_dim, fused_dim),
+            nn.ReLU()
+        ).to(self.device)
+        
+        # Set to evaluation mode
+        self.rgb_attention.eval()
+        self.flow_attention.eval()
+        self.rgb_norm.eval()
+        self.flow_norm.eval()
+        self.fusion_layer.eval()
+    
+    def fuse_features(self, rgb_features, flow_features):
+        """
+        Fuse RGB and flow features using cross-modal attention.
+        
+        Args:
+            rgb_features: RGB features tensor or numpy array
+            flow_features: Flow features tensor or numpy array
+            
+        Returns:
+            Fused features
+        """
+        # Convert to tensors if needed
+        if isinstance(rgb_features, np.ndarray):
+            rgb_features = torch.from_numpy(rgb_features).float().to(self.device)
+        if isinstance(flow_features, np.ndarray):
+            flow_features = torch.from_numpy(flow_features).float().to(self.device)
+        
+        # Make sure dimensions match
+        if rgb_features.dim() == 1:
+            rgb_features = rgb_features.unsqueeze(0)
+        if flow_features.dim() == 1:
+            flow_features = flow_features.unsqueeze(0)
+        
+        # Apply normalization (standardizes feature scales)
+        rgb_features = self.rgb_norm(rgb_features)
+        flow_features = self.flow_norm(flow_features)
+        
+        # Apply attention mechanisms
+        with torch.no_grad():
+            # Flow-guided attention for RGB
+            flow_attn_weights = self.flow_attention(flow_features)
+            attended_rgb = rgb_features * flow_attn_weights
+            
+            # RGB-guided attention for flow
+            rgb_attn_weights = self.rgb_attention(rgb_features)
+            attended_flow = flow_features * rgb_attn_weights
+            
+            # Concatenate attended features
+            combined_features = torch.cat([attended_rgb, attended_flow], dim=1)
+            
+            # Apply fusion layer
+            fused_features = self.fusion_layer(combined_features)
+        
+        # Return as numpy array
+        return fused_features.cpu().numpy()
+    
+    def fuse_features_batch(self, rgb_features_batch, flow_features_batch):
+        """
+        Fuse batches of RGB and flow features.
+        
+        Args:
+            rgb_features_batch: Batch of RGB features (numpy array or tensor)
+            flow_features_batch: Batch of flow features (numpy array or tensor)
+            
+        Returns:
+            Batch of fused features
+        """
+        # Convert to tensors if needed
+        if isinstance(rgb_features_batch, np.ndarray):
+            rgb_features_batch = torch.from_numpy(rgb_features_batch).float().to(self.device)
+        if isinstance(flow_features_batch, np.ndarray):
+            flow_features_batch = torch.from_numpy(flow_features_batch).float().to(self.device)
+        
+        # Apply normalization
+        rgb_features_batch = self.rgb_norm(rgb_features_batch)
+        flow_features_batch = self.flow_norm(flow_features_batch)
+        
+        # Apply attention and fusion
+        with torch.no_grad():
+            # Flow-guided attention for RGB
+            flow_attn_weights = self.flow_attention(flow_features_batch)
+            attended_rgb = rgb_features_batch * flow_attn_weights
+            
+            # RGB-guided attention for flow
+            rgb_attn_weights = self.rgb_attention(rgb_features_batch)
+            attended_flow = flow_features_batch * rgb_attn_weights
+            
+            # Concatenate attended features
+            combined_features = torch.cat([attended_rgb, attended_flow], dim=1)
+            
+            # Apply fusion layer
+            fused_features = self.fusion_layer(combined_features)
+        
+        # Return as numpy array
+        return fused_features.cpu().numpy() 
