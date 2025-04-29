@@ -8,6 +8,12 @@ python src/run_data_processing.py
 
 To retry processing previously failed videos:
 python src/run_data_processing.py --reset-failed
+
+To process only video frames (no optical flow):
+python src/run_data_processing.py --frames-only
+
+To process only optical flow (no video frames):
+python src/run_data_processing.py --flow-only
 """
 
 import os
@@ -79,7 +85,14 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Road Accident Detection Data Processing Pipeline")
     parser.add_argument("--reset-failed", action="store_true", help="Reset the list of failed videos and attempt to process them again")
+    parser.add_argument("--frames-only", action="store_true", help="Process and save only frames (no optical flow)")
+    parser.add_argument("--flow-only", action="store_true", help="Process and save only optical flow (no frames)")
     args = parser.parse_args()
+    
+    # Validate arguments
+    if args.frames_only and args.flow_only:
+        logger.error("Cannot use both --frames-only and --flow-only flags together.")
+        return 1
     
     # Check dependencies
     if not check_dependencies():
@@ -96,9 +109,23 @@ def main():
     
     # Import after modifying path
     try:
-        from src.data_processing.config import DATA_PATH
+        from src.data_processing.config import DATA_PATH, PROCESSING_OPTIONS
         from src.data_processing.dataset_creator import create_dataset
         logger.info("Successfully imported required modules")
+        
+        # Configure processing options
+        processing_options = {
+            'process_frames': not args.flow_only,
+            'process_flow': not args.frames_only,
+            'save_metadata': True
+        }
+        
+        if args.frames_only:
+            logger.info("Processing only frames (no optical flow) as requested by --frames-only flag")
+        elif args.flow_only:
+            logger.info("Processing only optical flow (no frames) as requested by --flow-only flag")
+        else:
+            logger.info("Processing both frames and optical flow")
     except ImportError as e:
         logger.error(f"Failed to import required modules: {e}")
         logger.error(f"Import path details: {traceback.format_exc()}")
@@ -121,15 +148,20 @@ def main():
     os.makedirs(DATA_PATH['processed_parent'], exist_ok=True)
     
     # Run the data processing pipeline
+    options_str = []
     if args.reset_failed:
-        logger.info("Starting data processing pipeline with reset_failed=True...")
-    else:
-        logger.info("Starting data processing pipeline...")
+        options_str.append("reset_failed=True")
+    if args.frames_only:
+        options_str.append("frames_only")
+    if args.flow_only:
+        options_str.append("flow_only")
+    
+    logger.info(f"Starting data processing pipeline{' with ' + ', '.join(options_str) if options_str else ''}...")
     
     start_time = time.time()
     
     try:
-        create_dataset(reset_failed=args.reset_failed)
+        create_dataset(reset_failed=args.reset_failed, processing_options=processing_options)
         
         elapsed_time = time.time() - start_time
         hours, remainder = divmod(elapsed_time, 3600)

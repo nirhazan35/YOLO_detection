@@ -13,7 +13,7 @@ import argparse
 
 # Import project modules
 from data_processing.config import (
-    DATA_PATH, VIDEO_CONFIG, RANDOM_SEED, KEEP_ORIGINALS
+    DATA_PATH, VIDEO_CONFIG, RANDOM_SEED, KEEP_ORIGINALS, PROCESSING_OPTIONS
 )
 from data_processing.data_preprocessing import (
     preprocess_video_all, load_video_frames,
@@ -84,7 +84,7 @@ def get_video_paths(accident_dir, non_accident_dir):
         'non_accident': non_accident_videos
     }
 
-def process_video(video_path, label, video_idx, config, use_gpu=None):
+def process_video(video_path, label, video_idx, config, use_gpu=None, processing_options=None):
     """
     Process a single video through the entire pipeline.
     
@@ -94,6 +94,7 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
         video_idx: Video index for unique naming
         config: Processing configuration
         use_gpu: Whether to use GPU for processing (None for auto-detection)
+        processing_options: Dictionary with processing options (process_frames, process_flow)
         
     Returns:
         Boolean indicating success or failure
@@ -102,25 +103,36 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
         # Normalize video path
         video_path = normalize_path(video_path)
         
-        # Determine output base directory based on label
-        if label == 'accident':
-            output_base_dir = DATA_PATH['processed_accidents']
-        else:
-            output_base_dir = DATA_PATH['processed_non_accidents']
+        # Use default processing options if none provided
+        if processing_options is None:
+            processing_options = PROCESSING_OPTIONS
         
         # Create a unique video name
         video_name = f"{label}_{video_idx:04d}"
         
-        # Define output directories - directly in the accident/non-accident folder
-        output_dir = output_base_dir
-        frames_output_dir = os.path.join(output_dir, f"{video_name}_frames")
-        flow_output_dir = os.path.join(output_dir, f"{video_name}_flow")
+        # Define output directories based on label
+        if label == 'accident':
+            output_dir = DATA_PATH['processed_accidents']
+            frames_dir = DATA_PATH['accidents_frames']
+            flow_dir = DATA_PATH['accidents_flow']
+        else:
+            output_dir = DATA_PATH['processed_non_accidents']
+            frames_dir = DATA_PATH['non_accidents_frames']
+            flow_dir = DATA_PATH['non_accidents_flow']
+        
+        # Create specific output paths
+        frames_output_dir = os.path.join(frames_dir, video_name)
+        flow_output_dir = os.path.join(flow_dir, video_name)
         metadata_path = os.path.join(output_dir, f"{video_name}_metadata.json")
         
         # Skip if already processed and metadata exists (for resuming)
         if os.path.exists(metadata_path):
             # Validate the processed data
-            is_valid, error = validate_processed_data(output_dir, metadata_path)
+            is_valid, error = validate_processed_data(
+                frames_dir=frames_output_dir if processing_options.get('process_frames', True) else None,
+                flow_dir=flow_output_dir if processing_options.get('process_flow', True) else None,
+                metadata_path=metadata_path
+            )
             if is_valid:
                 logger.info(f"Skipping already processed video: {video_name}")
                 return True
@@ -128,13 +140,16 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
                 logger.warning(f"Previously processed data invalid: {error}. Reprocessing...")
         
         # Create directories
-        os.makedirs(frames_output_dir, exist_ok=True)
-        os.makedirs(flow_output_dir, exist_ok=True)
+        if processing_options.get('process_frames', True):
+            os.makedirs(frames_output_dir, exist_ok=True)
+        
+        if processing_options.get('process_flow', True):
+            os.makedirs(flow_output_dir, exist_ok=True)
         
         # Step 1: Preprocess video and extract frames
         processed_data = preprocess_video_all(
             video_path, 
-            output_dir,  # Use the output directory directly
+            DATA_PATH['temp_dir'],  # Use the temp directory
             video_name, 
             config
         )
@@ -150,45 +165,56 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
             logger.error(f"No frames extracted from: {video_path}")
             return False
         
-        # Step 2: Compute optical flow (auto-detect GPU if not specified)
-        flow_frames = compute_optical_flow(
-            frames, 
-            use_gpu=use_gpu
-        )
+        # Process based on options
+        flow_frames = None
         
-        # Validate consistency between RGB frames and optical flow
-        is_consistent, error_msg = validate_rgb_flow_pair(frames, flow_frames)
-        if not is_consistent:
-            logger.warning(f"RGB-flow consistency check failed: {error_msg}. Will try to continue anyway.")
+        # Step 2: Compute optical flow if requested
+        if processing_options.get('process_flow', True):
+            flow_frames = compute_optical_flow(
+                frames, 
+                use_gpu=use_gpu
+            )
+            
+            # Validate consistency between RGB frames and optical flow
+            is_consistent, error_msg = validate_rgb_flow_pair(frames, flow_frames)
+            if not is_consistent:
+                logger.warning(f"RGB-flow consistency check failed: {error_msg}. Will try to continue anyway.")
         
-        # Step 3: Save frames and flow
-        for i, frame in enumerate(frames):
-            cv2.imwrite(os.path.join(frames_output_dir, f"frame_{i:02d}.jpg"), frame)
+        # Step 3: Save frames and flow based on options
+        if processing_options.get('process_frames', True):
+            for i, frame in enumerate(frames):
+                cv2.imwrite(os.path.join(frames_output_dir, f"frame_{i:02d}.jpg"), frame)
+            logger.info(f"Saved {len(frames)} frames to {frames_output_dir}")
         
-        save_optical_flow_frames(
-            flow_frames, 
-            flow_output_dir, 
-            video_name
-        )
+        if processing_options.get('process_flow', True) and flow_frames is not None:
+            save_optical_flow_frames(
+                flow_frames, 
+                flow_output_dir, 
+                video_name
+            )
+            logger.info(f"Saved {len(flow_frames)} flow frames to {flow_output_dir}")
         
-        # Save metadata including processing parameters
-        metadata = {
-            'original_path': video_path,
-            'label': label,
-            'frames_count': len(frames),
-            'flow_frames_count': len(flow_frames),
-            'processed_date': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'processing_config': {
-                'resolution': config['target_resolution'],
-                'fps': config['target_fps'],
-                'content_aware': config['content_aware_sampling'],
-                'flow_method': 'raft' if 'raft' in str(flow_frames).lower() else 'standard'
-            },
-            'split': None  # Will be assigned later in the pipeline
-        }
-        
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        # Save metadata if requested
+        if processing_options.get('save_metadata', True):
+            metadata = {
+                'original_path': video_path,
+                'label': label,
+                'frames_count': len(frames),
+                'flow_frames_count': len(flow_frames) if flow_frames is not None else 0,
+                'processed_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'processing_config': {
+                    'resolution': config['target_resolution'],
+                    'fps': config['target_fps'],
+                    'content_aware': config['content_aware_sampling'],
+                    'flow_method': 'raft' if flow_frames is not None and 'raft' in str(flow_frames).lower() else 'standard',
+                    'process_frames': processing_options.get('process_frames', True),
+                    'process_flow': processing_options.get('process_flow', True)
+                },
+                'split': None  # Will be assigned later in the pipeline
+            }
+            
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
         
         # Clean up temporary files
         if 'preprocessed_video' in processed_data and os.path.exists(processed_data['preprocessed_video']):
@@ -266,20 +292,37 @@ def load_progress(output_dir, reset_failed=False):
         logger.error(f"Error loading progress: {e}")
         return [], []
 
-def create_dataset(reset_failed=False):
+def create_dataset(reset_failed=False, processing_options=None):
     """
     Main function to create the dataset.
     
     Args:
         reset_failed: Whether to retry processing previously failed videos
+        processing_options: Dictionary with processing options (process_frames, process_flow)
     """
     # Set random seed for reproducibility
     set_random_seed(RANDOM_SEED)
+    
+    # Use default processing options if none provided
+    if processing_options is None:
+        processing_options = PROCESSING_OPTIONS
     
     # Create output directories
     os.makedirs(DATA_PATH['processed_parent'], exist_ok=True)
     os.makedirs(DATA_PATH['processed_accidents'], exist_ok=True)
     os.makedirs(DATA_PATH['processed_non_accidents'], exist_ok=True)
+    
+    # Create organized output directories based on processing options
+    if processing_options.get('process_frames', True):
+        os.makedirs(DATA_PATH['accidents_frames'], exist_ok=True)
+        os.makedirs(DATA_PATH['non_accidents_frames'], exist_ok=True)
+    
+    if processing_options.get('process_flow', True):
+        os.makedirs(DATA_PATH['accidents_flow'], exist_ok=True)
+        os.makedirs(DATA_PATH['non_accidents_flow'], exist_ok=True)
+    
+    # Create temp directory
+    os.makedirs(DATA_PATH['temp_dir'], exist_ok=True)
     
     # Get video paths
     video_paths = get_video_paths(DATA_PATH['accidents'], DATA_PATH['non_accidents'])
@@ -311,7 +354,8 @@ def create_dataset(reset_failed=False):
                 label, 
                 i, 
                 VIDEO_CONFIG,
-                use_gpu=use_gpu
+                use_gpu=use_gpu,
+                processing_options=processing_options
             )
             
             if success:
@@ -330,12 +374,22 @@ def create_dataset(reset_failed=False):
     
     # Print summary
     logger.info(f"Dataset creation complete. Processed {len(processed_videos)} videos, failed {len(failed_videos)} videos.")
+    logger.info(f"Processing options: frames={processing_options.get('process_frames', True)}, flow={processing_options.get('process_flow', True)}")
     
     return processed_videos, failed_videos
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dataset creation for road accident detection")
     parser.add_argument("--reset-failed", action="store_true", help="Reset the list of failed videos and attempt to process them again")
+    parser.add_argument("--frames-only", action="store_true", help="Process and save only frames (no optical flow)")
+    parser.add_argument("--flow-only", action="store_true", help="Process and save only optical flow (no frames)")
     args = parser.parse_args()
     
-    create_dataset(reset_failed=args.reset_failed)
+    # Configure processing options
+    options = {
+        'process_frames': not args.flow_only,
+        'process_flow': not args.frames_only,
+        'save_metadata': True
+    }
+    
+    create_dataset(reset_failed=args.reset_failed, processing_options=options)

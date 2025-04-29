@@ -18,6 +18,12 @@ DATA_PATH = {
     'processed_accidents': './data/processed/accidents',
     'processed_non_accidents': './data/processed/non_accidents',
     
+    # Organized output directories for frames and flow
+    'accidents_frames': './data/processed/accidents/frames',
+    'accidents_flow': './data/processed/accidents/flow',
+    'non_accidents_frames': './data/processed/non_accidents/frames',
+    'non_accidents_flow': './data/processed/non_accidents/flow',
+    
     # Temporary directory for intermediate processing
     'temp_dir': './data/processed/temp'
 }
@@ -31,7 +37,14 @@ VIDEO_CONFIG = {
     'max_video_length': 60,           # Maximum video length to process in seconds
     'temporal_subsampling': True,     # Whether to apply temporal subsampling for long videos
     'content_aware_sampling': True,   # Whether to use content-aware frame selection
-    'motion_threshold': 0.05         # Minimum normalized motion for content-aware selection
+    'motion_threshold': 0.05          # Minimum normalized motion for content-aware selection
+}
+
+# Processing options
+PROCESSING_OPTIONS = {
+    'process_frames': True,          # Whether to process and save frames
+    'process_flow': True,            # Whether to process and save optical flow
+    'save_metadata': True            # Whether to save metadata
 }
 
 # Data split

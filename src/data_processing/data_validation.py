@@ -240,55 +240,63 @@ def validate_rgb_flow_pair(rgb_frames, flow_frames):
     
     return True, ""
 
-def validate_processed_data(data_dir, metadata_file):
+def validate_processed_data(frames_dir=None, flow_dir=None, metadata_path=None):
     """
-    Validate processed data by checking file integrity and metadata.
+    Validate processed data based on directory structure and metadata.
     
     Args:
-        data_dir: Directory containing processed frames and flow
-        metadata_file: Path to metadata JSON file
+        frames_dir: Directory containing frame images (can be None if not processing frames)
+        flow_dir: Directory containing optical flow data (can be None if not processing flow)
+        metadata_path: Path to metadata JSON file
         
     Returns:
-        Boolean indicating if data is valid and an error message if invalid
+        Tuple of (is_valid, error_message)
     """
     try:
-        # Check if directory exists
-        if not os.path.exists(data_dir):
-            return False, f"Directory does not exist: {data_dir}"
-        
-        # Check metadata file
-        if not os.path.exists(metadata_file):
-            return False, f"Metadata file not found: {metadata_file}"
+        # Check if metadata exists
+        if metadata_path is None or not os.path.exists(metadata_path):
+            return False, "Metadata file not found"
         
         # Load metadata
-        with open(metadata_file, 'r') as f:
+        with open(metadata_path, 'r') as f:
             metadata = json.load(f)
         
-        # Check if metadata contains required fields
-        required_fields = ['frames_count', 'flow_frames_count', 'label', 'split']
+        # Check for required metadata fields
+        required_fields = ['label', 'frames_count', 'processed_date', 'processing_config']
         for field in required_fields:
             if field not in metadata:
-                return False, f"Missing field in metadata: {field}"
+                return False, f"Missing required metadata field: {field}"
         
-        # Check if frames exist
-        frames_dir = os.path.join(data_dir, f"{os.path.basename(metadata_file).split('_metadata.json')[0]}_frames")
-        if not os.path.exists(frames_dir):
-            return False, f"Frames directory not found: {frames_dir}"
+        # Determine what needs to be validated based on processing config
+        process_frames = metadata.get('processing_config', {}).get('process_frames', True)
+        process_flow = metadata.get('processing_config', {}).get('process_flow', True)
         
-        # Count frames
-        frame_files = [f for f in os.listdir(frames_dir) if f.endswith('.jpg')]
-        if len(frame_files) != metadata['frames_count']:
-            return False, f"Mismatch in frame count: expected {metadata['frames_count']}, found {len(frame_files)}"
+        # Validate frames directory if processing frames
+        if process_frames:
+            if frames_dir is None or not os.path.exists(frames_dir):
+                return False, "Frames directory not found"
+            
+            frame_files = [f for f in os.listdir(frames_dir) if f.endswith('.jpg')]
+            if len(frame_files) == 0:
+                return False, "No frame files found"
+            
+            if len(frame_files) != metadata.get('frames_count', 0):
+                return False, f"Frame count mismatch: {len(frame_files)} found, {metadata.get('frames_count')} expected"
         
-        # Check if optical flow exists
-        flow_dir = os.path.join(data_dir, f"{os.path.basename(metadata_file).split('_metadata.json')[0]}_flow")
-        if not os.path.exists(flow_dir):
-            return False, f"Flow directory not found: {flow_dir}"
-        
-        # Count flow frames
-        flow_files = [f for f in os.listdir(flow_dir) if f.endswith('.jpg')]
-        if len(flow_files) != metadata['flow_frames_count']:
-            return False, f"Mismatch in flow frame count: expected {metadata['flow_frames_count']}, found {len(flow_files)}"
+        # Validate flow directory if processing optical flow
+        if process_flow:
+            if flow_dir is None or not os.path.exists(flow_dir):
+                return False, "Flow directory not found"
+            
+            # In an organized structure, flow files might be in a subdirectory or have a different pattern
+            flow_files = [f for f in os.listdir(flow_dir) if f.endswith('.jpg') or f.endswith('.npy')]
+            if len(flow_files) == 0:
+                return False, "No flow files found"
+            
+            # If flow_frames_count is in metadata, verify against it (might be 2x frames for x and y components)
+            flow_frames_count = metadata.get('flow_frames_count', 0)
+            if flow_frames_count > 0 and len(flow_files) < flow_frames_count:
+                return False, f"Flow file count mismatch: {len(flow_files)} found, {flow_frames_count} expected"
         
         return True, ""
     
