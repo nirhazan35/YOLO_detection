@@ -7,6 +7,7 @@ import gc
 import torch
 from tqdm import tqdm
 import logging
+import platform
 
 # Import config and validation module from data_processing package
 from data_processing.config import PARALLEL_PROCESSING, GPU_CONFIG, VIDEO_CONFIG, KEEP_ORIGINALS
@@ -18,6 +19,33 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Check if running on Windows
+IS_WINDOWS = platform.system() == 'Windows'
+
+def normalize_path(path):
+    """
+    Normalize file paths to be compatible with the current operating system.
+    This is especially important when working with paths stored in JSON files
+    that might have been created on a different OS.
+    
+    Args:
+        path: The file path to normalize
+        
+    Returns:
+        Normalized path compatible with the current OS
+    """
+    if path is None:
+        return None
+    
+    # Convert path separators to the current OS format
+    normalized = os.path.normpath(path)
+    
+    # If we're on Windows and the path starts with ./ or .\\, make it relative to current dir
+    if IS_WINDOWS and (normalized.startswith('./') or normalized.startswith('.\\')):
+        normalized = normalized[2:]
+    
+    return normalized
 
 # Check if CUDA is available
 def check_gpu_availability():
@@ -373,6 +401,9 @@ def preprocess_video_all(input_path, output_dir, video_name, config=None):
         config = VIDEO_CONFIG
     
     try:
+        # Normalize the input path for the current OS
+        input_path = normalize_path(input_path)
+        
         # Create temp directory if needed
         temp_dir = os.path.join(output_dir, "temp")
         os.makedirs(temp_dir, exist_ok=True)

@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import torch
 import gc
+import argparse
 
 # Import project modules
 from data_processing.config import (
@@ -16,7 +17,7 @@ from data_processing.config import (
 )
 from data_processing.data_preprocessing import (
     preprocess_video_all, load_video_frames,
-    check_gpu_availability
+    check_gpu_availability, normalize_path
 )
 from data_processing.optical_flow import compute_optical_flow, save_optical_flow_frames
 from data_processing.data_validation import validate_processed_data, validate_rgb_flow_pair
@@ -61,14 +62,20 @@ def get_video_paths(accident_dir, non_accident_dir):
     for root, _, files in os.walk(accident_dir):
         for file in files:
             if file.lower().endswith(video_extensions):
-                accident_videos.append(os.path.join(root, file))
+                video_path = os.path.join(root, file)
+                # Normalize path for current OS
+                video_path = normalize_path(video_path)
+                accident_videos.append(video_path)
     
     # Get non-accident videos
     non_accident_videos = []
     for root, _, files in os.walk(non_accident_dir):
         for file in files:
             if file.lower().endswith(video_extensions):
-                non_accident_videos.append(os.path.join(root, file))
+                video_path = os.path.join(root, file)
+                # Normalize path for current OS
+                video_path = normalize_path(video_path)
+                non_accident_videos.append(video_path)
     
     logger.info(f"Found {len(accident_videos)} accident videos and {len(non_accident_videos)} non-accident videos")
     
@@ -92,6 +99,9 @@ def process_video(video_path, label, video_idx, config, use_gpu=None):
         Boolean indicating success or failure
     """
     try:
+        # Normalize video path
+        video_path = normalize_path(video_path)
+        
         # Determine output base directory based on label
         if label == 'accident':
             output_base_dir = DATA_PATH['processed_accidents']
@@ -220,12 +230,13 @@ def save_progress(output_dir, processed_videos, failed_videos):
     
     logger.info(f"Saved progress to {progress_file}")
 
-def load_progress(output_dir):
+def load_progress(output_dir, reset_failed=False):
     """
     Load processing progress.
     
     Args:
         output_dir: Base output directory
+        reset_failed: Whether to reset the failed videos list and retry processing them
         
     Returns:
         Tuple of (processed_videos, failed_videos)
@@ -241,17 +252,27 @@ def load_progress(output_dir):
             progress = json.load(f)
         
         processed_videos = progress.get('processed_videos', [])
-        failed_videos = progress.get('failed_videos', [])
+        failed_videos = progress.get('failed_videos', []) if not reset_failed else []
         
-        logger.info(f"Loaded progress: {len(processed_videos)} processed, {len(failed_videos)} failed")
+        if reset_failed:
+            logger.info(f"Reset failed videos list. Will attempt to process {len(progress.get('failed_videos', []))} previously failed videos.")
+            # Also save the updated progress file with empty failed videos
+            save_progress(output_dir, processed_videos, failed_videos)
+        else:
+            logger.info(f"Loaded progress: {len(processed_videos)} processed, {len(failed_videos)} failed")
         
         return processed_videos, failed_videos
     except Exception as e:
         logger.error(f"Error loading progress: {e}")
         return [], []
 
-def create_dataset():
-    """Main function to create the dataset."""
+def create_dataset(reset_failed=False):
+    """
+    Main function to create the dataset.
+    
+    Args:
+        reset_failed: Whether to retry processing previously failed videos
+    """
     # Set random seed for reproducibility
     set_random_seed(RANDOM_SEED)
     
@@ -264,7 +285,7 @@ def create_dataset():
     video_paths = get_video_paths(DATA_PATH['accidents'], DATA_PATH['non_accidents'])
     
     # Load progress if exists
-    processed_videos, failed_videos = load_progress(DATA_PATH['processed_parent'])
+    processed_videos, failed_videos = load_progress(DATA_PATH['processed_parent'], reset_failed)
     
     # Check if GPU is available
     device = check_gpu_availability()
@@ -278,7 +299,7 @@ def create_dataset():
                 logger.info(f"Skipping already processed video: {video_path}")
                 continue
             
-            # Skip if already failed
+            # Skip if already failed and reset_failed is False
             if video_path in failed_videos:
                 logger.info(f"Skipping previously failed video: {video_path}")
                 continue
@@ -313,4 +334,8 @@ def create_dataset():
     return processed_videos, failed_videos
 
 if __name__ == "__main__":
-    create_dataset()
+    parser = argparse.ArgumentParser(description="Dataset creation for road accident detection")
+    parser.add_argument("--reset-failed", action="store_true", help="Reset the list of failed videos and attempt to process them again")
+    args = parser.parse_args()
+    
+    create_dataset(reset_failed=args.reset_failed)
